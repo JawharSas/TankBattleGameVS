@@ -6,11 +6,15 @@
 // ============================================================
 
 #define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib")
+#include <windows.h>
 #include <iostream>
 #include <vector>
+#include <deque>
 #include <string>
-#include <conio.h>      // _kbhit(), _getch() - Windows only
-#include <windows.h>    // SetConsoleCursorPosition, Sleep
+#include <conio.h>
 #include <ctime>
 #include <cstdlib>
 #include <cmath>
@@ -22,9 +26,9 @@
 //  CONSTANTS  (must come before any globals that reference them)
 // ============================================================
 
-const int MAP_W   = 50;
-const int MAP_H   = 22;
-const int UI_TOP  = 0;
+const int MAP_W = 50;
+const int MAP_H = 22;
+const int UI_TOP = 0;
 const int MAP_TOP = 4;
 
 // ============================================================
@@ -43,7 +47,7 @@ static bool      g_firstFrame = true;
 void BufSet(int col, int row, char ch, int color) {
     if (col < 0 || col >= MAP_W || row < 0 || row >= MAP_H) return;
     g_backBuf[row][col].Char.AsciiChar = ch;
-    g_backBuf[row][col].Attributes     = (WORD)color;
+    g_backBuf[row][col].Attributes = (WORD)color;
 }
 
 void SetColor(int color) {
@@ -87,39 +91,39 @@ enum Tile { EMPTY = 0, WALL, DESTRUCTIBLE, FLAG_RED, FLAG_BLUE, BASE_RED, BASE_B
 // ============================================================
 
 struct Bullet {
-    float x     = 0.0f;
-    float y     = 0.0f;
-    float dx    = 0.0f;
-    float dy    = 0.0f;
+    float x = 0.0f;
+    float y = 0.0f;
+    float dx = 0.0f;
+    float dy = 0.0f;
     int ownerID = -1;
     bool active = false;
 };
 
 struct Player {
-    float x            = 0.0f;
-    float y            = 0.0f;
-    int dx             = 1;
-    int dy             = 0;
-    int health         = 3;
-    int maxHealth      = 3;
-    int ammo           = 20;
-    int score          = 0;
-    int kills          = 0;
-    int deaths         = 0;
-    bool alive         = true;
-    bool hasFlag       = false;  // CTF mode
-    int team           = 0;      // 0 = red, 1 = blue
-    int colorCode      = 15;
-    char symbol        = '?';
-    std::string name   = "Player";
+    float x = 0.0f;
+    float y = 0.0f;
+    int dx = 1;
+    int dy = 0;
+    int health = 3;
+    int maxHealth = 3;
+    int ammo = 20;
+    int score = 0;
+    int kills = 0;
+    int deaths = 0;
+    bool alive = true;
+    bool hasFlag = false;  // CTF mode
+    int team = 0;      // 0 = red, 1 = blue
+    int colorCode = 15;
+    char symbol = '?';
+    std::string name = "Player";
     // Controls
-    int keyUp          = 'w';
-    int keyDown        = 's';
-    int keyLeft        = 'a';
-    int keyRight       = 'd';
-    int keyShoot       = 'e';
+    int keyUp = 'w';
+    int keyDown = 's';
+    int keyLeft = 'a';
+    int keyRight = 'd';
+    int keyShoot = 'e';
     double shootCooldown = 0.0;
-    double respawnTimer  = 0.0;
+    double respawnTimer = 0.0;
 };
 
 // Gamemode
@@ -138,14 +142,23 @@ bool g_isBot[4] = { false, false, false, false };
 
 // AI state per bot
 struct AIState {
-    double thinkTimer  = 0.0;   // how long until next decision
-    int    moveX       = 0;     // current chosen move direction
-    int    moveY       = 0;
-    double stuckTimer  = 0.0;   // time since we last moved
-    float  lastX       = 0.0f;
-    float  lastY       = 0.0f;
-    bool   wander      = false; // true = picking random direction
-    double wanderTimer = 0.0;
+    double thinkTimer = 0.0;
+    double shootTimer = 0.0;   // personal shoot cooldown
+    double dodgeTimer = 0.0;   // how long to dodge
+    int    dodgeX = 0;
+    int    dodgeY = 0;
+    double stuckTimer = 0.0;
+    float  lastX = -999.f;
+    float  lastY = -999.f;
+    // BFS path
+    std::vector<std::pair<int, int>> path;
+    int    pathStep = 0;
+    double pathAge = 999.0; // recompute when old
+    int    targetIdx = -1;
+    float  goalX = 0.f;
+    float  goalY = 0.f;
+    bool   isOllama = false; // controlled by local LLM
+    std::string ollamaDecision = "";
 };
 AIState g_aiState[4];
 int g_scoreLimit = 10;
@@ -160,6 +173,61 @@ double g_messageTimer = 0;
 struct Flag { float x, y; bool atBase; int carrier; };
 Flag g_flags[2]; // 0=red 1=blue
 float g_baseX[2], g_baseY[2];
+
+// Ollama settings
+bool        g_ollamaEnabled = false;
+std::string g_ollamaModel = "llama3";  // default model name
+int         g_ollamaPort = 11434;
+
+// Simple blocking HTTP POST to localhost Ollama /api/generate
+// Returns the "response" field text, or "" on failure
+std::string OllamaAsk(const std::string& model, const std::string& prompt) {
+    // Build raw HTTP request
+    std::string body = "{\"model\":\"" + model + "\",\"prompt\":\"" + prompt + "\",\"stream\":false}";
+    std::string req =
+        "POST /api/generate HTTP/1.0\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n" + body;
+
+    // Use WinSock
+    WSADATA wsd; WSAStartup(MAKEWORD(2, 2), &wsd);
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) { WSACleanup(); return ""; }
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)g_ollamaPort);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    // 2-second timeout
+    DWORD tv = 2000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
+
+    if (connect(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
+        closesocket(s); WSACleanup(); return "";
+    }
+    send(s, req.c_str(), (int)req.size(), 0);
+
+    // Receive response
+    std::string resp;
+    char buf[4096];
+    int n;
+    while ((n = recv(s, buf, sizeof(buf) - 1, 0)) > 0) {
+        buf[n] = 0; resp += buf;
+    }
+    closesocket(s); WSACleanup();
+
+    // Parse "response":"..." from JSON (simple search)
+    auto pos = resp.find("\"response\":\"");
+    if (pos == std::string::npos) return "";
+    pos += 13;
+    auto end = resp.find("\"", pos);
+    if (end == std::string::npos) return "";
+    return resp.substr(pos, end - pos);
+}
 
 // ============================================================
 //  MAP GENERATION
@@ -229,16 +297,16 @@ void SetupPlayers() {
     // P2: Arrows (special) + G
     // P3: IJKL + H
     // P4: 8456 + 0 (numpad won't map nicely in kbhit; use number row)
-    int kUp[]    = { 'w','i','t','b' };
-    int kDown[]  = { 's','k','g','n' };
-    int kLeft[]  = { 'a','j','f','v' };
+    int kUp[] = { 'w','i','t','b' };
+    int kDown[] = { 's','k','g','n' };
+    int kLeft[] = { 'a','j','f','v' };
     int kRight[] = { 'd','l','h','m' };
     int kShoot[] = { 'e','o','y',',' };
 
     // Spawn positions
     float spawnX[] = { 2.5f, (float)(MAP_W - 3.5f), 2.5f,               (float)(MAP_W - 3.5f) };
     float spawnY[] = { 2.5f, 2.5f,                  (float)(MAP_H - 3.5f),(float)(MAP_H - 3.5f) };
-    int teams[]    = { 0, 1, 0, 1 };
+    int teams[] = { 0, 1, 0, 1 };
 
     // Spawn facing directions: P1 right, P2 left, P3 right, P4 left
     int spawnDX[] = { 1, -1,  1, -1 };
@@ -299,8 +367,10 @@ void DrawUI() {
     char row0[64];
     sprintf(row0, " TANK BATTLE | %-18s| Time:%3ds | Limit:%2d ", modeStr.c_str(), secs, g_scoreLimit);
     GotoXY(0, 0);
+    SetColor(0); std::cout << std::string(80, ' ');
+    GotoXY(0, 0);
     SetColor(COL_YELLOW);
-    std::cout << std::left << std::setw(MAP_W) << row0;
+    std::cout << std::left << std::setw(80) << row0;
 
     // Row 1: player stats - build full string then print once at GotoXY
     GotoXY(0, 1);
@@ -329,7 +399,7 @@ void DrawUI() {
     GotoXY(0, 2);
     SetColor(COL_DARK_GRAY);
     char ctrl[128] = "Keys: ";
-    const char* labels[] = {"P1:WASD+E","P2:IJKL+O","P3:TFGH+Y","P4:BVNM+,"};
+    const char* labels[] = { "P1:WASD+E","P2:IJKL+O","P3:TFGH+Y","P4:BVNM+," };
     for (int i = 0; i < g_numPlayers; i++) {
         if (!g_isBot[i]) { strcat(ctrl, labels[i]); strcat(ctrl, " "); }
     }
@@ -357,9 +427,9 @@ void RenderFrame() {
             switch (g_map[y][x]) {
             case WALL:         BufSet(x, y, (char)219, COL_DARK_GRAY); break;
             case DESTRUCTIBLE: BufSet(x, y, (char)177, COL_ORANGE);    break;
-            case BASE_RED:     BufSet(x, y, 'B',       COL_RED);       break;
-            case BASE_BLUE:    BufSet(x, y, 'B',       COL_BLUE);      break;
-            default:           BufSet(x, y, ' ',       0);             break;
+            case BASE_RED:     BufSet(x, y, 'B', COL_RED);       break;
+            case BASE_BLUE:    BufSet(x, y, 'B', COL_BLUE);      break;
+            default:           BufSet(x, y, ' ', 0);             break;
             }
         }
     }
@@ -377,7 +447,7 @@ void RenderFrame() {
         for (int i = 0; i < 2; i++) {
             if (g_flags[i].carrier == -1) {
                 BufSet((int)g_flags[i].x, (int)g_flags[i].y,
-                       'F', i == 0 ? COL_RED : COL_BLUE);
+                    'F', i == 0 ? COL_RED : COL_BLUE);
             }
         }
     }
@@ -387,8 +457,8 @@ void RenderFrame() {
         if (!p.alive) continue;
         // Draw facing indicator behind player
         int fx = (int)p.x - p.dx, fy = (int)p.y - p.dy;
-        if (g_map[fy < 0 ? 0 : fy >= MAP_H ? MAP_H-1 : fy]
-                 [fx < 0 ? 0 : fx >= MAP_W ? MAP_W-1 : fx] == EMPTY)
+        if (g_map[fy < 0 ? 0 : fy >= MAP_H ? MAP_H - 1 : fy]
+            [fx < 0 ? 0 : fx >= MAP_W ? MAP_W - 1 : fx] == EMPTY)
             BufSet(fx, fy, '.', COL_DARK_GRAY);
         BufSet((int)p.x, (int)p.y, p.symbol, p.colorCode);
     }
@@ -403,26 +473,32 @@ void RenderFrame() {
         }
     }
 
-    // Message overlay (centered)
+    // Message overlay (centered) - black text on yellow background
     if (g_messageTimer > 0 && !g_message.empty()) {
-        int mx = MAP_W / 2 - (int)g_message.size() / 2 - 1;
+        int msgLen = (int)g_message.size() + 4;
+        int mx = (MAP_W - msgLen) / 2;
         int my = MAP_H / 2;
-        // Background bar
-        for (int x = 0; x < MAP_W; x++) BufSet(x, my, ' ', COL_YELLOW * 16);
-        BufSet(mx, my, ' ', COL_YELLOW * 16);
+        if (mx < 0) mx = 0;
+        // ATTRIBUTE: background=YELLOW(6), foreground=BLACK(0) => 6<<4 = 96
+        WORD msgAttr = (WORD)(6 << 4) | 0;
+        // Padding spaces
+        BufSet(mx, my, ' ', (int)msgAttr);
+        BufSet(mx + 1, my, ' ', (int)msgAttr);
         for (int c = 0; c < (int)g_message.size(); c++)
-            BufSet(mx + 1 + c, my, g_message[c], 0 | (COL_YELLOW << 4));
+            BufSet(mx + 2 + c, my, g_message[c], (int)msgAttr);
+        BufSet(mx + 2 + (int)g_message.size(), my, ' ', (int)msgAttr);
+        BufSet(mx + 2 + (int)g_message.size() + 1, my, ' ', (int)msgAttr);
     }
 
     // Flush: WriteConsoleOutput for the whole map area in ONE call
-    COORD bufSize   = { MAP_W, MAP_H };
+    COORD bufSize = { MAP_W, MAP_H };
     COORD bufOrigin = { 0, 0 };
     SMALL_RECT writeRegion = { 0, MAP_TOP, MAP_W - 1, MAP_TOP + MAP_H - 1 };
     WriteConsoleOutputA(hConsole, &g_backBuf[0][0], bufSize, bufOrigin, &writeRegion);
 }
 
 // Legacy stubs kept so call sites compile (they're replaced below)
-void DrawMap()     {}
+void DrawMap() {}
 void DrawBullets() {}
 void DrawPlayers() {}
 void DrawMessage() {}
@@ -714,7 +790,8 @@ int Menu(const std::string& title, const std::vector<std::string>& options, int 
             if (i == sel) {
                 SetColor(COL_YELLOW);
                 std::cout << "  > " << options[i];
-            } else {
+            }
+            else {
                 SetColor(COL_WHITE);
                 std::cout << "    " << options[i];
             }
@@ -740,167 +817,287 @@ int Menu(const std::string& title, const std::vector<std::string>& options, int 
 
 void ShowResults() {
     ClearScreen();
-    SetColor(COL_YELLOW);
-    std::cout << "\n\n  ===== GAME OVER - RESULTS =====\n\n";
+    int row = 2;
+    GotoXY(2, row++); SetColor(COL_YELLOW);
+    std::cout << "  ===== GAME OVER - RESULTS =====";
+
     // Sort by score
     std::vector<int> order;
     for (int i = 0; i < g_numPlayers; i++) order.push_back(i);
     std::sort(order.begin(), order.end(), [](int a, int b) {
         return g_players[a].score > g_players[b].score; });
+
+    row++;
     for (int r = 0; r < (int)order.size(); r++) {
         int i = order[r];
+        GotoXY(2, row++);
+        SetColor(0); std::cout << std::string(60, ' ');
+        GotoXY(2, row - 1);
         SetColor(g_players[i].colorCode);
-        std::cout << "  " << (r + 1) << ". " << g_players[i].name
-            << "  Score:" << g_players[i].score
-            << "  Kills:" << g_players[i].kills
-            << "  Deaths:" << g_players[i].deaths << "\n";
+        char line[80];
+        const char* medal = (r == 0) ? ">> " : (r == 1) ? "   " : "   ";
+        sprintf(line, "%s%d. %-12s  Score:%-3d  Kills:%-3d  Deaths:%d",
+            medal, r + 1, g_players[i].name.c_str(),
+            g_players[i].score, g_players[i].kills, g_players[i].deaths);
+        std::cout << line;
     }
-    // Winner
-    SetColor(COL_YELLOW);
-    std::cout << "\n  WINNER: " << g_players[order[0]].name << "!\n\n";
+
+    row++;
+    GotoXY(2, row++); SetColor(COL_YELLOW);
+    char winline[64];
+    sprintf(winline, "  WINNER: %s !", g_players[order[0]].name.c_str());
+    std::cout << winline;
+
+    row++;
+    GotoXY(2, row);   SetColor(COL_WHITE);
+    std::cout << "  Press any key to return to menu...";
     ResetColor();
-    std::cout << "  Press any key to return to menu...\n";
     (void)_getch();
 }
 
 // ============================================================
-//  AI / BOT LOGIC
+//  AI / BOT LOGIC  -  BFS pathfinding + smart behaviour
 // ============================================================
 
-// Simple BFS-style direction picker: try to step toward target
-// Returns true if a walkable step was found
-bool AIStepToward(int botIdx, float tx, float ty, int& outDX, int& outDY) {
-    Player& p = g_players[botIdx];
-    // Preferred direction
-    int pdx = 0, pdy = 0;
-    float diffX = tx - p.x, diffY = ty - p.y;
-    if (fabsf(diffX) >= fabsf(diffY)) pdx = (diffX > 0) ? 1 : -1;
-    else                               pdy = (diffY > 0) ? 1 : -1;
+// BFS from (sx,sy) to (tx,ty), returns path as (dx,dy) steps
+std::vector<std::pair<int, int>> BFSPath(int sx, int sy, int tx, int ty) {
+    std::vector<std::pair<int, int>> result;
+    if (sx == tx && sy == ty) return result;
 
-    // Try preferred, then perpendicular, then opposite perpendicular
-    int tries[4][2] = {
-        {pdx, pdy},
-        {pdy, pdx},      // rotate 90
-        {-pdy, -pdx},    // rotate -90
-        {-pdx, -pdy}     // opposite
-    };
-    for (auto& t : tries) {
-        if (t[0] == 0 && t[1] == 0) continue;
-        if (IsWalkable(p.x + t[0], p.y + t[1])) {
-            outDX = t[0]; outDY = t[1];
-            return true;
+    // visited grid
+    static bool vis[MAP_H][MAP_W];
+    static std::pair<int, int> from[MAP_H][MAP_W]; // parent cell
+    memset(vis, 0, sizeof(vis));
+    memset(from, -1, sizeof(from));
+
+    struct Cell { int x, y; };
+    std::vector<Cell> queue;
+    queue.reserve(MAP_W * MAP_H);
+    int head = 0;
+    vis[sy][sx] = true;
+    queue.push_back({ sx, sy });
+
+    const int dx4[] = { 1,-1,0,0 };
+    const int dy4[] = { 0,0,1,-1 };
+
+    bool found = false;
+    while (head < (int)queue.size() && !found) {
+        Cell cur = queue[head++];
+        for (int d = 0; d < 4; d++) {
+            int nx = cur.x + dx4[d];
+            int ny = cur.y + dy4[d];
+            if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H) continue;
+            if (vis[ny][nx]) continue;
+            int tile = g_map[ny][nx];
+            if (tile == WALL || tile == DESTRUCTIBLE) continue;
+            vis[ny][nx] = true;
+            from[ny][nx] = { cur.x, cur.y };
+            queue.push_back({ nx, ny });
+            if (nx == tx && ny == ty) { found = true; break; }
         }
     }
-    return false;
+    if (!found) return result;
+
+    // Reconstruct path
+    std::vector<std::pair<int, int>> rev;
+    int cx = tx, cy = ty;
+    while (cx != sx || cy != sy) {
+        auto [px, py] = from[cy][cx];
+        rev.push_back({ cx - px, cy - py }); // direction step
+        cx = px; cy = py;
+    }
+    std::reverse(rev.begin(), rev.end());
+    return rev;
+}
+
+// Check if there is clear line-of-sight between two points (no walls)
+bool HasLOS(int x1, int y1, int x2, int y2) {
+    int dx = abs(x2 - x1), dy = abs(y2 - y1);
+    int sx = (x2 > x1) ? 1 : -1, sy = (y2 > y1) ? 1 : -1;
+    int err = dx - dy;
+    int cx = x1, cy = y1;
+    while (true) {
+        if (cx == x2 && cy == y2) return true;
+        int tile = g_map[cy][cx];
+        if (tile == WALL || tile == DESTRUCTIBLE) return false;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; cx += sx; }
+        if (e2 < dx) { err += dx; cy += sy; }
+    }
+}
+
+// Parse Ollama response into a direction + shoot command
+// Expected format: "UP", "DOWN", "LEFT", "RIGHT", "SHOOT_UP" etc.
+void ApplyOllamaDecision(int idx, const std::string& decision) {
+    Player& p = g_players[idx];
+    if (!p.alive) return;
+    std::string d = decision;
+    for (auto& c : d) c = (char)toupper((unsigned char)c);
+
+    if (d.find("UP") != std::string::npos && d.find("SHOOT") == std::string::npos) MovePlayer(idx, 0, -1);
+    else if (d.find("DOWN") != std::string::npos && d.find("SHOOT") == std::string::npos) MovePlayer(idx, 0, 1);
+    else if (d.find("LEFT") != std::string::npos && d.find("SHOOT") == std::string::npos) MovePlayer(idx, -1, 0);
+    else if (d.find("RIGHT") != std::string::npos && d.find("SHOOT") == std::string::npos) MovePlayer(idx, 1, 0);
+    if (d.find("SHOOT") != std::string::npos) {
+        if (d.find("UP") != std::string::npos) { p.dx = 0; p.dy = -1; }
+        else if (d.find("DOWN") != std::string::npos) { p.dx = 0; p.dy = 1; }
+        else if (d.find("LEFT") != std::string::npos) { p.dx = -1; p.dy = 0; }
+        else if (d.find("RIGHT") != std::string::npos) { p.dx = 1; p.dy = 0; }
+        Shoot(idx);
+    }
 }
 
 void UpdateAI(int idx, double dt) {
     if (!g_isBot[idx]) return;
     Player& p = g_players[idx];
     AIState& ai = g_aiState[idx];
-
     if (!p.alive) return;
 
-    // Shoot cooldown handled by main loop already
-    // Cooldown our own think timer
     ai.thinkTimer -= dt;
+    ai.shootTimer -= dt;
+    ai.dodgeTimer -= dt;
+    ai.pathAge += dt;
 
-    // -- Find nearest human/enemy --
-    int targetIdx = -1;
+    // --- Find best target ---
+    int bestTarget = -1;
     float bestDist = 1e9f;
     for (int i = 0; i < g_numPlayers; i++) {
         if (i == idx || !g_players[i].alive) continue;
         if (g_mode == TEAM_BATTLE && g_players[i].team == p.team) continue;
-        float dx = g_players[i].x - p.x;
-        float dy = g_players[i].y - p.y;
-        float dist = sqrtf(dx*dx + dy*dy);
-        if (dist < bestDist) { bestDist = dist; targetIdx = i; }
+        float ddx = g_players[i].x - p.x;
+        float ddy = g_players[i].y - p.y;
+        float dist = sqrtf(ddx * ddx + ddy * ddy);
+        if (dist < bestDist) { bestDist = dist; bestTarget = i; }
     }
+    ai.targetIdx = bestTarget;
 
-    // -- Shoot if lined up with a target --
-    if (targetIdx >= 0) {
-        Player& tgt = g_players[targetIdx];
-        float dx = tgt.x - p.x, dy = tgt.y - p.y;
-        // Same row or column, within range
-        bool lineX = (fabsf(dy) < 1.0f) && (fabsf(dx) < 12.0f);
-        bool lineY = (fabsf(dx) < 1.0f) && (fabsf(dy) < 12.0f);
-        if (lineX || lineY) {
-            // Face target
-            if (lineX) { p.dx = (dx > 0) ? 1 : -1; p.dy = 0; }
-            else        { p.dy = (dy > 0) ? 1 : -1; p.dx = 0; }
-            Shoot(idx);
-        }
-    }
-
-    // -- CTF: go for flag if don't have it, else return to base --
+    // --- Determine goal position ---
     float goalX = p.x, goalY = p.y;
     if (g_mode == CAPTURE_THE_FLAG) {
-        int enemyFlag = 1 - p.team;
-        if (!p.hasFlag) {
-            // Go grab enemy flag if it's dropped or at base
-            goalX = g_flags[enemyFlag].x;
-            goalY = g_flags[enemyFlag].y;
-        } else {
-            // Return to own base
-            goalX = g_baseX[p.team];
-            goalY = g_baseY[p.team];
+        int eFlag = 1 - p.team;
+        if (!p.hasFlag) { goalX = g_flags[eFlag].x; goalY = g_flags[eFlag].y; }
+        else { goalX = g_baseX[p.team];   goalY = g_baseY[p.team]; }
+    }
+    else if (bestTarget >= 0) {
+        goalX = g_players[bestTarget].x;
+        goalY = g_players[bestTarget].y;
+    }
+    else {
+        // Roam to a random map position
+        if (ai.pathAge > 3.0f) {
+            goalX = (float)(2 + rand() % (MAP_W - 4));
+            goalY = (float)(2 + rand() % (MAP_H - 4));
         }
-    } else if (targetIdx >= 0) {
-        // Chase target
-        goalX = g_players[targetIdx].x;
-        goalY = g_players[targetIdx].y;
     }
 
-    // -- Move every thinkTimer tick --
-    if (ai.thinkTimer <= 0.0) {
-        ai.thinkTimer = 0.13 + (rand() % 5) * 0.01; // slight randomness
+    // --- SHOOTING LOGIC ---
+    if (bestTarget >= 0 && ai.shootTimer <= 0.0) {
+        Player& tgt = g_players[bestTarget];
+        float ddx = tgt.x - p.x, ddy = tgt.y - p.y;
+        int ix = (int)p.x, iy = (int)p.y;
+        int tx = (int)tgt.x, ty = (int)tgt.y;
 
-        // Stuck detection
-        float movedDist = fabsf(p.x - ai.lastX) + fabsf(p.y - ai.lastY);
+        bool sameRow = (iy == ty) && fabsf(ddx) < 14.f && HasLOS(ix, iy, tx, ty);
+        bool sameCol = (ix == tx) && fabsf(ddy) < 14.f && HasLOS(ix, iy, tx, ty);
+        bool diagClose = bestDist < 3.5f; // shoot in facing dir if very close
+
+        if (sameRow) {
+            p.dx = (ddx > 0) ? 1 : -1; p.dy = 0;
+            Shoot(idx);
+            ai.shootTimer = 0.25 + (rand() % 3) * 0.05;
+        }
+        else if (sameCol) {
+            p.dy = (ddy > 0) ? 1 : -1; p.dx = 0;
+            Shoot(idx);
+            ai.shootTimer = 0.25 + (rand() % 3) * 0.05;
+        }
+        else if (diagClose) {
+            Shoot(idx);
+            ai.shootTimer = 0.35;
+        }
+    }
+
+    // --- DODGE incoming bullets ---
+    if (ai.dodgeTimer <= 0.0) {
+        for (auto& b : g_bullets) {
+            if (!b.active || b.ownerID == idx) continue;
+            float bdx = b.x - p.x, bdy = b.y - p.y;
+            float dist = sqrtf(bdx * bdx + bdy * bdy);
+            if (dist < 4.0f) {
+                // Dodge perpendicular to bullet direction
+                int perpX = (int)(-b.dy), perpY = (int)(b.dx);
+                if (IsWalkable(p.x + perpX, p.y + perpY)) {
+                    MovePlayer(idx, perpX, perpY);
+                }
+                else if (IsWalkable(p.x - perpX, p.y - perpY)) {
+                    MovePlayer(idx, -perpX, -perpY);
+                }
+                ai.dodgeTimer = 0.2;
+                break;
+            }
+        }
+    }
+
+    // --- THINK TICK: recompute path and move ---
+    if (ai.thinkTimer <= 0.0) {
+        // Randomise think rate slightly (120-180ms) so bots feel natural
+        ai.thinkTimer = 0.12 + (rand() % 7) * 0.01;
+
+        // Ollama mode: ask LLM for decision asynchronously
+        if (ai.isOllama && g_ollamaEnabled) {
+            // Build compact state string
+            char prompt[512];
+            int tx2 = (bestTarget >= 0) ? (int)g_players[bestTarget].x : -1;
+            int ty2 = (bestTarget >= 0) ? (int)g_players[bestTarget].y : -1;
+            sprintf(prompt,
+                "You control a tank at (%d,%d) facing (%d,%d). "
+                "Enemy at (%d,%d). Health:%d/3. Ammo:%d. Map is %dx%d. "
+                "Reply with ONLY one word: UP DOWN LEFT RIGHT SHOOT_UP SHOOT_DOWN SHOOT_LEFT SHOOT_RIGHT",
+                (int)p.x, (int)p.y, p.dx, p.dy, tx2, ty2,
+                p.health, p.ammo, MAP_W, MAP_H);
+            // Non-blocking: just apply last decision, fire off new request
+            if (!ai.ollamaDecision.empty())
+                ApplyOllamaDecision(idx, ai.ollamaDecision);
+            // Fire request (blocking but short timeout = 2s, won't freeze noticeably)
+            ai.ollamaDecision = OllamaAsk(g_ollamaModel, prompt);
+            return;
+        }
+
+        // Stuck detection: if barely moved, force path recompute
+        float moved = fabsf(p.x - ai.lastX) + fabsf(p.y - ai.lastY);
+        if (moved < 0.5f) ai.stuckTimer += ai.thinkTimer;
+        else               ai.stuckTimer = 0.0;
         ai.lastX = p.x; ai.lastY = p.y;
 
-        if (movedDist < 0.5f) {
-            ai.stuckTimer += ai.thinkTimer;
-        } else {
-            ai.stuckTimer = 0.0;
-            ai.wander = false;
+        // Recompute BFS path when: goal changed, path exhausted, stuck, or path old
+        bool needPath = (ai.path.empty()
+            || ai.pathStep >= (int)ai.path.size()
+            || ai.pathAge > 0.6
+            || ai.stuckTimer > 0.4
+            || fabsf(goalX - ai.goalX) + fabsf(goalY - ai.goalY) > 1.5f);
+
+        if (needPath) {
+            ai.goalX = goalX; ai.goalY = goalY;
+            ai.path = BFSPath((int)p.x, (int)p.y, (int)goalX, (int)goalY);
+            ai.pathStep = 0;
+            ai.pathAge = 0.0;
+            if (ai.stuckTimer > 0.4) ai.stuckTimer = 0.0;
         }
 
-        // If stuck for >0.6s, wander randomly
-        if (ai.stuckTimer > 0.6) {
-            ai.wander = true;
-            ai.wanderTimer = 0.5 + (rand() % 4) * 0.15;
-            ai.stuckTimer = 0.0;
-            // Pick a random walkable direction
-            int dirs[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
-            int r = rand() % 4;
-            ai.moveX = dirs[r][0];
-            ai.moveY = dirs[r][1];
-        }
-
-        if (ai.wander) {
-            ai.wanderTimer -= ai.thinkTimer;
-            if (ai.wanderTimer <= 0) ai.wander = false;
-            // Try wander dir, else pick new random
-            if (!IsWalkable(p.x + ai.moveX, p.y + ai.moveY)) {
-                int dirs[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
-                int r = rand() % 4;
-                ai.moveX = dirs[r][0];
-                ai.moveY = dirs[r][1];
+        // Follow BFS path
+        if (!ai.path.empty() && ai.pathStep < (int)ai.path.size()) {
+            auto [mdx, mdy] = ai.path[ai.pathStep];
+            // Verify step is still walkable (map may have changed)
+            if (IsWalkable(p.x + mdx, p.y + mdy)) {
+                MovePlayer(idx, mdx, mdy);
+                ai.pathStep++;
             }
-        } else {
-            // Navigate toward goal
-            int dx = 0, dy = 0;
-            if (!AIStepToward(idx, goalX, goalY, dx, dy)) {
-                // Fallback random
-                int dirs[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
-                int r = rand() % 4;
-                dx = dirs[r][0]; dy = dirs[r][1];
+            else {
+                // Obstacle appeared - replan next tick
+                ai.path.clear();
+                ai.pathStep = 0;
             }
-            ai.moveX = dx; ai.moveY = dy;
         }
-
-        MovePlayer(idx, ai.moveX, ai.moveY);
     }
 }
 
@@ -1033,7 +1230,252 @@ void GameLoop() {
 
 int main() {
     srand((unsigned)time(0));
+
+    // Set console size: 80 wide, 32 tall - enough for MAP + UI rows
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    // Buffer first (must be >= window size)
+    COORD bufSize = { 82, 34 };
+    SetConsoleScreenBufferSize(hOut, bufSize);
+    // Then window
+    SMALL_RECT winRect = { 0, 0, 81, 33 };
+    SetConsoleWindowInfo(hOut, TRUE, &winRect);
+    // Title bar
+    SetConsoleTitleA("Tank Battle - Local Multiplayer");
+
     HideCursor();
+
+    // ============================================================
+    //  SECRET ARCADE  (Q in main menu)
+    // ============================================================
+    auto RunSnake = [&]() {
+        ClearScreen();
+        // Snake game
+        const int SW = 40, SH = 20, STOP = 4 + SH;
+        struct Pt { int x, y; };
+        std::deque<Pt> snake; snake.push_back({ SW / 2,SH / 2 });
+        Pt food = { rand() % SW,rand() % SH };
+        int sdx = 1, sdy = 0; bool alive2 = true; int sScore = 0;
+        SetConsoleTitleA("SNAKE - Arrow keys, ESC=quit");
+        while (alive2) {
+            // draw border
+            for (int x = 0; x < SW + 2; x++) { GotoXY(x, MAP_TOP - 1); SetColor(COL_GREEN); std::cout << '-'; }
+            for (int x = 0; x < SW + 2; x++) { GotoXY(x, MAP_TOP + SH); SetColor(COL_GREEN); std::cout << '-'; }
+            for (int y = MAP_TOP - 1; y <= MAP_TOP + SH; y++) { GotoXY(0, y); SetColor(COL_GREEN); std::cout << '|'; GotoXY(SW + 1, y); std::cout << '|'; }
+            // food
+            GotoXY(food.x + 1, food.y + MAP_TOP); SetColor(COL_RED); std::cout << '*';
+            // snake
+            for (auto& s : snake) { GotoXY(s.x + 1, s.y + MAP_TOP); SetColor(COL_GREEN); std::cout << 'O'; }
+            // score
+            GotoXY(0, 0); SetColor(COL_YELLOW); std::cout << "SNAKE  Score:" << sScore << "  ESC=quit  Arrows=move  ";
+            Sleep(120);
+            // input
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)break;
+            if (GetAsyncKeyState(VK_UP) & 0x8000 && sdy != 1) { sdx = 0; sdy = -1; }
+            if (GetAsyncKeyState(VK_DOWN) & 0x8000 && sdy != -1) { sdx = 0; sdy = 1; }
+            if (GetAsyncKeyState(VK_LEFT) & 0x8000 && sdx != 1) { sdx = -1; sdy = 0; }
+            if (GetAsyncKeyState(VK_RIGHT) & 0x8000 && sdx != -1) { sdx = 1; sdy = 0; }
+            Pt head = { snake.front().x + sdx,snake.front().y + sdy };
+            if (head.x < 0 || head.x >= SW || head.y < 0 || head.y >= SH) { alive2 = false; break; }
+            for (auto& s : snake)if (s.x == head.x && s.y == head.y) { alive2 = false; break; }
+            snake.push_front(head);
+            if (head.x == food.x && head.y == food.y) {
+                sScore++;
+                food = { rand() % SW,rand() % SH };
+            }
+            else {
+                GotoXY(snake.back().x + 1, snake.back().y + MAP_TOP); SetColor(0); std::cout << ' ';
+                snake.pop_back();
+            }
+        }
+        ClearScreen(); GotoXY(2, 4); SetColor(COL_YELLOW); std::cout << "GAME OVER! Score: " << sScore;
+        GotoXY(2, 6); SetColor(COL_WHITE); std::cout << "Press any key..."; (void)_getch();
+        SetConsoleTitleA("Tank Battle - Local Multiplayer");
+        };
+
+    auto RunPong = [&]() {
+        ClearScreen();
+        const int PW = 60, PH = 22;
+        float bx = PW / 2.f, by = PH / 2.f, bvx = 1.2f, bvy = 0.8f;
+        int p1y = PH / 2, p2y = PH / 2, sc1 = 0, sc2 = 0;
+        SetConsoleTitleA("PONG - W/S=P1  UP/DOWN=P2  ESC=quit");
+        LARGE_INTEGER pf, pt, pp; QueryPerformanceFrequency(&pf); QueryPerformanceCounter(&pp);
+        while (true) {
+            QueryPerformanceCounter(&pt);
+            double pdt = ((double)(pt.QuadPart - pp.QuadPart) / pf.QuadPart); pp = pt;
+            if (pdt > 0.05)pdt = 0.05;
+            // input
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)break;
+            if (GetAsyncKeyState('W') & 0x8000 && p1y > 1)p1y--;
+            if (GetAsyncKeyState('S') & 0x8000 && p1y < PH - 2)p1y++;
+            if (GetAsyncKeyState(VK_UP) & 0x8000 && p2y > 1)p2y--;
+            if (GetAsyncKeyState(VK_DOWN) & 0x8000 && p2y < PH - 2)p2y++;
+            bx += bvx; by += bvy;
+            if (by <= 0 || by >= PH - 1)bvy = -bvy;
+            if ((int)bx == 2 && abs((int)by - p1y) <= 1) { bvx = fabsf(bvx); bvx *= 1.02f; }
+            if ((int)bx == PW - 3 && abs((int)by - p2y) <= 1) { bvx = -fabsf(bvx); bvx *= 1.02f; if (bvx < -3)bvx = -3; }
+            if (bx < 0) { sc2++; bx = PW / 2; by = PH / 2; bvx = 1.2f; bvy = 0.8f; }
+            if (bx >= PW) { sc1++; bx = PW / 2; by = PH / 2; bvx = -1.2f; bvy = 0.8f; }
+            // draw
+            for (int y = 0; y < PH; y++) {
+                GotoXY(0, y + 1); SetColor(0); std::cout << std::string(PW + 2, ' ');
+                GotoXY(0, y + 1); SetColor(COL_WHITE); std::cout << '|';
+                GotoXY(PW + 1, y + 1); std::cout << '|';
+            }
+            for (int yy = -1; yy <= 1; yy++) { int py = p1y + yy; if (py >= 0 && py < PH) { GotoXY(2, py + 1); SetColor(COL_CYAN); std::cout << '|'; } }
+            for (int yy = -1; yy <= 1; yy++) { int py = p2y + yy; if (py >= 0 && py < PH) { GotoXY(PW - 1, py + 1); SetColor(COL_YELLOW); std::cout << '|'; } }
+            GotoXY((int)bx, (int)by + 1); SetColor(COL_RED); std::cout << 'O';
+            GotoXY(0, 0); SetColor(COL_WHITE);
+            char sc[64]; sprintf(sc, "PONG  P1:%d  P2:%d  W/S vs UP/DN  ESC=quit", sc1, sc2); std::cout << sc;
+            Sleep(16);
+        }
+        SetConsoleTitleA("Tank Battle - Local Multiplayer"); ClearScreen();
+        };
+
+    auto RunBreakout = [&]() {
+        ClearScreen();
+        const int BW = 50, BH = 20, ROWS = 5, COLS = 12;
+        bool bricks[ROWS][COLS]; for (int r = 0; r < ROWS; r++)for (int c = 0; c < COLS; c++)bricks[r][c] = true;
+        float bx = BW / 2.f, by = BH - 3.f, bvx = 1.f, bvy = -1.f;
+        int padx = BW / 2, padW = 8, lives = 3, bsc = 0;
+        int totalBricks = ROWS * COLS;
+        SetConsoleTitleA("BREAKOUT - LEFT/RIGHT=paddle  ESC=quit");
+        while (lives > 0 && totalBricks > 0) {
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)break;
+            if (GetAsyncKeyState(VK_LEFT) & 0x8000 && padx > 1)padx--;
+            if (GetAsyncKeyState(VK_RIGHT) & 0x8000 && padx < BW - padW - 1)padx++;
+            bx += bvx; by += bvy;
+            if (bx <= 0 || bx >= BW - 1)bvx = -bvx;
+            if (by <= 0)bvy = fabsf(bvy);
+            // paddle
+            if ((int)by == BH - 3 && (int)bx >= padx && (int)bx <= padx + padW) { bvy = -fabsf(bvy); bvx += (bx - (padx + padW / 2.f)) * 0.1f; }
+            if (by >= BH - 1) { lives--; bx = BW / 2; by = BH - 3; bvx = 1; bvy = -1; }
+            // brick collision
+            int br = (int)(by / 2) - 1, bc = (int)(bx * COLS / BW);
+            if (br >= 0 && br < ROWS && bc >= 0 && bc < COLS && bricks[br][bc]) { bricks[br][bc] = false; bvy = -bvy; bsc += 10; totalBricks--; }
+            // draw
+            ClearScreen();
+            GotoXY(0, 0); SetColor(COL_YELLOW); char hdr[64]; sprintf(hdr, "BREAKOUT  Score:%d  Lives:%d  ESC=quit", bsc, lives); std::cout << hdr;
+            int colors[] = { COL_RED,COL_MAGENTA,COL_YELLOW,COL_GREEN,COL_CYAN };
+            for (int r = 0; r < ROWS; r++)for (int c = 0; c < COLS; c++)if (bricks[r][c]) {
+                GotoXY(c * (BW / COLS) + 1, r * 2 + 2); SetColor(colors[r]);
+                std::cout << "===";
+            }
+            GotoXY((int)bx, MAP_TOP + (int)by); SetColor(COL_WHITE); std::cout << 'O';
+            for (int px = padx; px < padx + padW; px++) { GotoXY(px, MAP_TOP + BH - 2); SetColor(COL_CYAN); std::cout << '='; }
+            Sleep(30);
+        }
+        ClearScreen(); GotoXY(2, 4); SetColor(COL_YELLOW);
+        std::cout << (totalBricks == 0 ? "YOU WIN! " : "GAME OVER  ") << "Score:" << bsc;
+        GotoXY(2, 6); SetColor(COL_WHITE); std::cout << "Press any key..."; (void)_getch();
+        SetConsoleTitleA("Tank Battle - Local Multiplayer");
+        };
+
+    auto RunTetris = [&]() {
+        ClearScreen();
+        const int TW = 10, TH = 20;
+        int board[TH][TW] = {};
+        // 7 tetrominoes (each is 4 cells relative to pivot)
+        int pieces[7][4][2] = {
+            {{0,0},{1,0},{-1,0},{2,0}},  // I
+            {{0,0},{1,0},{0,-1},{1,-1}}, // O
+            {{0,0},{-1,0},{1,0},{0,-1}}, // T
+            {{0,0},{-1,0},{0,-1},{-1,-1 + 1}}, // S (approx)
+            {{0,0},{1,0},{0,-1},{1,-1 - 1 + 1}}, // Z
+            {{0,0},{-1,0},{1,0},{1,-1}}, // L
+            {{0,0},{-1,0},{1,0},{-1,-1}},// J
+        };
+        int pieceColors[] = { COL_CYAN,COL_YELLOW,COL_MAGENTA,COL_GREEN,COL_RED,COL_ORANGE,COL_BLUE };
+        int cur = rand() % 7, cx = TW / 2, cy = 2, rot = 0;
+        int tScore = 0; double fall = 0, fallRate = 0.5;
+        LARGE_INTEGER tf, tt2, tp2; QueryPerformanceFrequency(&tf); QueryPerformanceCounter(&tp2);
+        auto canPlace = [&](int px, int py, int pc)->bool {
+            for (int i = 0; i < 4; i++) { int nx = px + pieces[pc][i][0], ny = py + pieces[pc][i][1]; if (nx < 0 || nx >= TW || ny >= TH)return false; if (ny >= 0 && board[ny][nx])return false; }return true;
+            };
+        auto lockPiece = [&]() {
+            for (int i = 0; i < 4; i++) { int nx = cx + pieces[cur][i][0], ny = cy + pieces[cur][i][1]; if (ny >= 0 && ny < TH && nx >= 0 && nx < TW)board[ny][nx] = pieceColors[cur] + 1; }
+            // clear lines
+            for (int y = TH - 1; y >= 0; y--) { bool full = true; for (int x = 0; x < TW; x++)if (!board[y][x]) { full = false; break; }if (full) { for (int yy = y; yy > 0; yy--)for (int xx = 0; xx < TW; xx++)board[yy][xx] = board[yy - 1][xx]; tScore += 100; y++; } }
+            cur = rand() % 7; cx = TW / 2; cy = 2;
+            if (!canPlace(cx, cy, cur)) { ClearScreen(); GotoXY(4, 8); SetColor(COL_RED); std::cout << "GAME OVER Score:" << tScore; GotoXY(4, 10); SetColor(COL_WHITE); std::cout << "Press any key"; (void)_getch(); cy = -99; }
+            };
+        SetConsoleTitleA("TETRIS - A/D=move  W=rotate  S=drop  ESC=quit");
+        while (cy != -99) {
+            QueryPerformanceCounter(&tt2); double tdt = ((double)(tt2.QuadPart - tp2.QuadPart) / tf.QuadPart); tp2 = tt2;
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)break;
+            static double kd = 0; kd -= tdt;
+            if (kd <= 0) {
+                kd = 0.12;
+                if (GetAsyncKeyState('A') & 0x8000 && canPlace(cx - 1, cy, cur))cx--;
+                if (GetAsyncKeyState('D') & 0x8000 && canPlace(cx + 1, cy, cur))cx++;
+                if (GetAsyncKeyState('S') & 0x8000 && canPlace(cx, cy + 1, cur))cy++;
+            }
+            if (GetAsyncKeyState('W') & 0x8000) { Sleep(100); } // placeholder rotate
+            fall += tdt; if (fall >= fallRate) { fall = 0; if (canPlace(cx, cy + 1, cur))cy++; else lockPiece(); }
+            // draw board
+            int ox = 2, oy = 1;
+            for (int y = 0; y < TH; y++) { GotoXY(ox, oy + y); SetColor(COL_DARK_GRAY); std::cout << '|'; for (int x = 0; x < TW; x++) { int c = board[y][x]; if (c) { SetColor(c - 1); std::cout << '#'; } else { SetColor(0); std::cout << ' '; } }SetColor(COL_DARK_GRAY); std::cout << '|'; }
+            GotoXY(ox, oy + TH); SetColor(COL_DARK_GRAY); std::cout << std::string(TW + 2, '-');
+            // draw piece
+            for (int i = 0; i < 4; i++) { int px = cx + pieces[cur][i][0], py = cy + pieces[cur][i][1]; if (py >= 0) { GotoXY(ox + 1 + px, oy + py); SetColor(pieceColors[cur]); std::cout << '#'; } }
+            GotoXY(TW + 6, oy + 2); SetColor(COL_YELLOW); char ts[32]; sprintf(ts, "Score:%d", tScore); std::cout << ts;
+            GotoXY(TW + 6, oy + 4); SetColor(COL_WHITE); std::cout << "A/D=move";
+            GotoXY(TW + 6, oy + 5); std::cout << "S=drop  ";
+            GotoXY(TW + 6, oy + 6); std::cout << "ESC=quit";
+            GotoXY(0, 0); SetColor(COL_YELLOW); std::cout << "TETRIS  Score:" << tScore << "  ";
+            Sleep(16);
+        }
+        SetConsoleTitleA("Tank Battle - Local Multiplayer"); ClearScreen();
+        };
+
+    auto RunSpaceInvaders = [&]() {
+        ClearScreen();
+        const int SW2 = 50, SH2 = 22;
+        struct Inv { int x, y; bool alive; };
+        std::vector<Inv> invaders;
+        for (int r = 0; r < 4; r++)for (int c = 0; c < 10; c++)invaders.push_back({ c * 4 + 5,r * 2 + 3,true });
+        int shipX = SW2 / 2, siScore = 0, siLives = 3;
+        struct SBullet { float x, y; bool active; };
+        std::vector<SBullet> sbullets;
+        double invDir = 0.3, invTimer = 0;
+        int invMoveDir = 1;
+        SetConsoleTitleA("SPACE INVADERS - LEFT/RIGHT=move  SPACE=shoot  ESC=quit");
+        LARGE_INTEGER sif, sit, sip; QueryPerformanceFrequency(&sif); QueryPerformanceCounter(&sip);
+        double shootCool = 0;
+        while (siLives > 0) {
+            QueryPerformanceCounter(&sit); double sdt = ((double)(sit.QuadPart - sip.QuadPart) / sif.QuadPart); sip = sit;
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)break;
+            if (GetAsyncKeyState(VK_LEFT) & 0x8000 && shipX > 1)shipX--;
+            if (GetAsyncKeyState(VK_RIGHT) & 0x8000 && shipX < SW2 - 2)shipX++;
+            shootCool -= sdt;
+            if (GetAsyncKeyState(VK_SPACE) & 0x8000 && shootCool <= 0) { sbullets.push_back({ (float)shipX,(float)(SH2 - 4),true }); shootCool = 0.4; }
+            // move bullets
+            for (auto& b : sbullets) { if (b.active) { b.y -= 12.f * (float)sdt; if (b.y < 1)b.active = false; } }
+            // move invaders
+            invTimer -= sdt;
+            if (invTimer <= 0) {
+                invTimer = invDir;
+                bool hitEdge = false;
+                for (auto& inv : invaders)if (inv.alive) { inv.x += invMoveDir; if (inv.x <= 0 || inv.x >= SW2 - 1)hitEdge = true; }
+                if (hitEdge) { invMoveDir = -invMoveDir; for (auto& inv : invaders)if (inv.alive)inv.y++; invDir = max(0.05, invDir * 0.95); }
+            }
+            // collision
+            for (auto& b : sbullets) { if (!b.active)continue; for (auto& inv : invaders) { if (inv.alive && (int)b.x == inv.x && abs((int)b.y - inv.y) <= 1) { inv.alive = false; b.active = false; siScore += 10; } } }
+            // invader reach bottom
+            for (auto& inv : invaders)if (inv.alive && inv.y >= SH2 - 3) { siLives = 0; }
+            // check win
+            bool anyAlive = false; for (auto& inv : invaders)if (inv.alive)anyAlive = true;
+            if (!anyAlive) { ClearScreen(); GotoXY(4, 8); SetColor(COL_YELLOW); std::cout << "YOU WIN! Score:" << siScore; GotoXY(4, 10); std::cout << "Press any key"; (void)_getch(); break; }
+            // draw
+            ClearScreen();
+            GotoXY(0, 0); SetColor(COL_YELLOW); char si_hdr[64]; sprintf(si_hdr, "SPACE INVADERS  Score:%d  Lives:%d", siScore, siLives); std::cout << si_hdr;
+            for (auto& inv : invaders)if (inv.alive) { GotoXY(inv.x, inv.y); SetColor(COL_GREEN); std::cout << 'W'; }
+            for (auto& b : sbullets)if (b.active) { GotoXY((int)b.x, (int)b.y); SetColor(COL_WHITE); std::cout << '|'; }
+            GotoXY(shipX, SH2 - 2); SetColor(COL_CYAN); std::cout << '^';
+            Sleep(16);
+        }
+        if (siLives == 0) { ClearScreen(); GotoXY(4, 8); SetColor(COL_RED); std::cout << "GAME OVER! Score:" << siScore; GotoXY(4, 10); SetColor(COL_WHITE); std::cout << "Press any key..."; (void)_getch(); }
+        SetConsoleTitleA("Tank Battle - Local Multiplayer"); ClearScreen();
+        };
 
     while (true) {
         // ---- Step 1: Player count ----
@@ -1044,14 +1486,81 @@ int main() {
             "3 Players",
             "4 Players"
         };
+        // Q = Secret Arcade
+        GotoXY(2, 26); SetColor(COL_DARK_GRAY);
+        std::cout << "  [Q] Secret Arcade";
+        ResetColor();
+
+        // Poll for Q before showing menu
+        bool goArcade = false;
+        {
+            // Short wait to let key settle
+            for (int qi = 0; qi < 5; qi++) { Sleep(30); if (GetAsyncKeyState('Q') & 0x8000) { goArcade = true; break; } }
+        }
+        if (goArcade) {
+            ClearScreen();
+            GotoXY(2, 2);  SetColor(COL_YELLOW); std::cout << "  *** SECRET ARCADE ***";
+            GotoXY(2, 4);  SetColor(COL_WHITE);  std::cout << "  1. Snake";
+            GotoXY(2, 5);                         std::cout << "  2. Pong";
+            GotoXY(2, 6);                         std::cout << "  3. Breakout";
+            GotoXY(2, 7);                         std::cout << "  4. Tetris";
+            GotoXY(2, 8);                         std::cout << "  5. Space Invaders";
+            GotoXY(2, 10); SetColor(COL_DARK_GRAY); std::cout << "  ESC = back to menu";
+            ResetColor();
+            int arcadeChoice = _getch();
+            if (arcadeChoice == '1') RunSnake();
+            else if (arcadeChoice == '2') RunPong();
+            else if (arcadeChoice == '3') RunBreakout();
+            else if (arcadeChoice == '4') RunTetris();
+            else if (arcadeChoice == '5') RunSpaceInvaders();
+            continue;
+        }
+
         int pc = Menu("Select Number of Players  [UP/DOWN + ENTER]:", playerOpts, 2, 13);
         if (pc < 0) break;
         for (int i = 0; i < 4; i++) g_isBot[i] = false;
         if (pc == 0) {
             g_numPlayers = 4;
             g_isBot[1] = true; g_isBot[2] = true; g_isBot[3] = true;
-        } else {
+        }
+        else {
             g_numPlayers = pc + 1;
+        }
+
+        // ---- Step 1b: Ollama setup (only if bots present) ----
+        bool anyBot = false;
+        for (int i = 0; i < 4; i++) if (g_isBot[i]) anyBot = true;
+        if (anyBot && g_numPlayers > 0) {
+            DrawTitle();
+            GotoXY(2, 13); SetColor(COL_YELLOW); std::cout << "  OLLAMA AI SUPPORT";
+            GotoXY(2, 15); SetColor(COL_WHITE);  std::cout << "  Do bots use your local Ollama AI?";
+            GotoXY(2, 17); SetColor(COL_CYAN);   std::cout << "  Y = Yes (needs Ollama running on port 11434)";
+            GotoXY(2, 18); SetColor(COL_WHITE);  std::cout << "  N = No  (built-in smart AI)";
+            GotoXY(2, 20); SetColor(COL_DARK_GRAY); std::cout << "  Ollama: https://ollama.com  |  run: ollama run llama3";
+            ResetColor();
+            int oc = _getch();
+            if (oc == 'y' || oc == 'Y') {
+                g_ollamaEnabled = true;
+                // Ask model name
+                ClearScreen();
+                GotoXY(2, 4); SetColor(COL_YELLOW); std::cout << "Enter Ollama model name (default: llama3):";
+                GotoXY(2, 6); SetColor(COL_WHITE);
+                // Restore echo for input
+                HANDLE hIn2 = GetStdHandle(STD_INPUT_HANDLE);
+                SetConsoleMode(hIn2, ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+                std::string modelIn; std::getline(std::cin, modelIn);
+                if (!modelIn.empty()) g_ollamaModel = modelIn;
+                SetConsoleMode(hIn2, ENABLE_PROCESSED_INPUT);
+                for (int i = 0; i < 4; i++) if (g_isBot[i]) g_aiState[i].isOllama = true;
+                GotoXY(2, 8); SetColor(COL_GREEN);
+                std::cout << "Ollama enabled! Model: " << g_ollamaModel;
+                GotoXY(2, 10); SetColor(COL_WHITE); std::cout << "Press any key...";
+                (void)_getch();
+            }
+            else {
+                g_ollamaEnabled = false;
+                for (int i = 0; i < 4; i++) g_aiState[i].isOllama = false;
+            }
         }
 
         // ---- Step 2: Game mode ----
@@ -1074,9 +1583,9 @@ int main() {
             "Long   - 20 pts / 300 seconds"
         };
         int lim = Menu("Select Match Length  [UP/DOWN + ENTER]:", limitOpts, 2, 13);
-        if (lim == 0)      { g_scoreLimit = 5;  g_timeLimit = 60; }
+        if (lim == 0) { g_scoreLimit = 5;  g_timeLimit = 60; }
         else if (lim == 1) { g_scoreLimit = 10; g_timeLimit = 120; }
-        else               { g_scoreLimit = 20; g_timeLimit = 300; }
+        else { g_scoreLimit = 20; g_timeLimit = 300; }
 
         // ---- Step 4: Controls reminder ----
         DrawTitle();
@@ -1085,14 +1594,14 @@ int main() {
             GotoXY(col, row++);
             SetColor(0); std::cout << std::string(60, ' ');
             GotoXY(col, row - 1);
-        };
+            };
         GotoXY(2, row); SetColor(COL_YELLOW);
         std::cout << "  CONTROLS (all players share one keyboard):";
         row++;
         GotoXY(2, row++); SetColor(COL_WHITE);  std::cout << "  Player 1 : W A S D  to move,  E to shoot";
         GotoXY(2, row++); SetColor(COL_CYAN);   std::cout << "  Player 2 : I J K L  to move,  O to shoot";
         GotoXY(2, row++); SetColor(COL_GREEN);  std::cout << "  Player 3 : T F G H  to move,  Y to shoot";
-        GotoXY(2, row++); SetColor(COL_MAGENTA);std::cout << "  Player 4 : B V N M  to move,  , to shoot";
+        GotoXY(2, row++); SetColor(COL_MAGENTA); std::cout << "  Player 4 : B V N M  to move,  , to shoot";
         GotoXY(2, row++); SetColor(COL_DARK_GRAY); std::cout << "  ESC = quit game";
         row++;
         GotoXY(2, row);   SetColor(COL_YELLOW); std::cout << "  Press any key to START...";
