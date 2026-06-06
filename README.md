@@ -1,2 +1,1 @@
-# TankBattleGameVS
-A TankBattleGame using visual studio as its gameplay | Used Some AI For Fixes/Gameplay
+This Game Should Be Played On Visual Studio Or Complier For C++
