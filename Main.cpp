@@ -5,8 +5,19 @@
 //  Compatible with Visual Studio 2019/2022 (Windows)
 // ============================================================
 
+
+// ============================================================
+//  EMBEDDED MANIFEST - tells Windows this is a trusted app
+// ============================================================
+#pragma comment(linker, "/manifestuac:\"level='asInvoker' uiAccess='false'\"")
+#pragma comment(linker, "/MANIFEST:EMBED")
+
+// App description embedded in the binary (shows in Task Manager / Properties)
+#pragma comment(exestr, "Tank Battle Game - Local Multiplayer by TankBattle Studios")
+
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib")
 #include <windows.h>
@@ -21,6 +32,8 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <shlobj.h>
+#pragma comment(lib, "shell32.lib")
 
 // ============================================================
 //  CONSTANTS  (must come before any globals that reference them)
@@ -174,59 +187,174 @@ struct Flag { float x, y; bool atBase; int carrier; };
 Flag g_flags[2]; // 0=red 1=blue
 float g_baseX[2], g_baseY[2];
 
-// Ollama settings
+// AI mode
+enum BotAIMode { AI_BUILTIN = 0, AI_EXTERNAL };
+BotAIMode   g_botAIMode = AI_BUILTIN;
+
+// External AI settings (Ollama / OpenAI-compatible)
+enum ExtAIProvider { EXT_OLLAMA = 0, EXT_OPENAI, EXT_CLAUDE, EXT_OTHER };
+ExtAIProvider g_extProvider = EXT_OLLAMA;
 bool        g_ollamaEnabled = false;
-std::string g_ollamaModel = "llama3";  // default model name
+std::string g_ollamaModel = "llama3";
 int         g_ollamaPort = 11434;
+std::string g_extApiKey = "";   // for OpenAI / Claude
+std::string g_extEndpoint = "";   // custom endpoint
 
-// Simple blocking HTTP POST to localhost Ollama /api/generate
-// Returns the "response" field text, or "" on failure
-std::string OllamaAsk(const std::string& model, const std::string& prompt) {
-    // Build raw HTTP request
-    std::string body = "{\"model\":\"" + model + "\",\"prompt\":\"" + prompt + "\",\"stream\":false}";
-    std::string req =
-        "POST /api/generate HTTP/1.0\r\n"
-        "Host: 127.0.0.1\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: " + std::to_string(body.size()) + "\r\n"
-        "\r\n" + body;
-
-    // Use WinSock
+// -- HTTP helper: POST json body to host:port/path, return raw response body --
+std::string HttpPost(const std::string& host, int port, const std::string& path,
+    const std::string& body, const std::string& extraHeaders = "") {
     WSADATA wsd; WSAStartup(MAKEWORD(2, 2), &wsd);
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) { WSACleanup(); return ""; }
-
     sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)g_ollamaPort);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-    // 2-second timeout
-    DWORD tv = 2000;
+    addr.sin_family = AF_INET; addr.sin_port = htons((u_short)port);
+    addr.sin_addr.s_addr = inet_addr(host.c_str());
+    DWORD tv = 3000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
-
-    if (connect(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
-        closesocket(s); WSACleanup(); return "";
-    }
+    if (connect(s, (sockaddr*)&addr, sizeof(addr)) != 0) { closesocket(s); WSACleanup(); return ""; }
+    std::string req = "POST " + path + " HTTP/1.0\r\n"
+        "Host: " + host + "\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        + extraHeaders + "\r\n" + body;
     send(s, req.c_str(), (int)req.size(), 0);
-
-    // Receive response
-    std::string resp;
-    char buf[4096];
-    int n;
-    while ((n = recv(s, buf, sizeof(buf) - 1, 0)) > 0) {
-        buf[n] = 0; resp += buf;
-    }
+    std::string resp; char buf[8192]; int n;
+    while ((n = recv(s, buf, sizeof(buf) - 1, 0)) > 0) { buf[n] = 0; resp += buf; }
     closesocket(s); WSACleanup();
+    // Return only body (after blank line)
+    auto pos = resp.find("\r\n\r\n");
+    return pos != std::string::npos ? resp.substr(pos + 4) : resp;
+}
 
-    // Parse "response":"..." from JSON (simple search)
-    auto pos = resp.find("\"response\":\"");
-    if (pos == std::string::npos) return "";
-    pos += 13;
-    auto end = resp.find("\"", pos);
-    if (end == std::string::npos) return "";
-    return resp.substr(pos, end - pos);
+// Parse a JSON string field: find "key":"VALUE" and return VALUE
+std::string ParseJsonStr(const std::string& json, const std::string& key) {
+    std::string needle = "\"" + key + "\":\"";
+    auto pos = json.find(needle);
+    if (pos == std::string::npos)return "";
+    pos += needle.size();
+    auto end = json.find("\"", pos);
+    return end != std::string::npos ? json.substr(pos, end - pos) : "";
+}
+
+// Build a compact game-state prompt the AI can understand
+std::string BuildGamePrompt(int botIdx) {
+    Player& p = g_players[botIdx];
+    // find nearest enemy
+    int tgtIdx = -1; float bestD = 1e9f;
+    for (int i = 0; i < g_numPlayers; i++) {
+        if (i == botIdx || !g_players[i].alive)continue;
+        if (g_mode == TEAM_BATTLE && g_players[i].team == p.team)continue;
+        float ddx = g_players[i].x - p.x, ddy = g_players[i].y - p.y;
+        float d = sqrtf(ddx * ddx + ddy * ddy);
+        if (d < bestD) { bestD = d; tgtIdx = i; }
+    }
+    char buf[600];
+    int ex = -1, ey = -1;
+    if (tgtIdx >= 0) { ex = (int)g_players[tgtIdx].x; ey = (int)g_players[tgtIdx].y; }
+    const char* modeStr = "Deathmatch";
+    if (g_mode == LAST_MAN_STANDING)modeStr = "LastManStanding";
+    else if (g_mode == TEAM_BATTLE)modeStr = "TeamBattle";
+    else if (g_mode == CAPTURE_THE_FLAG)modeStr = "CaptureTheFlag";
+    sprintf(buf,
+        "You are bot-%d in a %dx%d grid tank game (mode:%s). "
+        "Your pos:(%d,%d) facing:(%d,%d) HP:%d/3 ammo:%d team:%s. "
+        "Nearest enemy at (%d,%d) dist:%.1f. "
+        "Map walls block movement. "
+        "Reply with exactly ONE word from: UP DOWN LEFT RIGHT SHOOT_UP SHOOT_DOWN SHOOT_LEFT SHOOT_RIGHT GRAB_FLAG. "
+        "No explanation, just the word.",
+        botIdx, MAP_W, MAP_H, modeStr,
+        (int)p.x, (int)p.y, p.dx, p.dy, p.health, p.ammo,
+        p.team == 0 ? "RED" : "BLUE", ex, ey, bestD);
+    return std::string(buf);
+}
+
+// Ask an external AI and return a one-word action
+std::string ExternalAIAsk(int botIdx) {
+    std::string prompt = BuildGamePrompt(botIdx);
+    std::string resp = "";
+
+    if (g_extProvider == EXT_OLLAMA) {
+        // Ollama: POST to localhost:11434/api/generate
+        std::string body = "{\"model\":\"" + g_ollamaModel + "\","
+            "\"prompt\":\"" + prompt + "\","
+            "\"stream\":false,\"options\":{\"num_predict\":8}}";
+        resp = HttpPost("127.0.0.1", g_ollamaPort, "/api/generate", body);
+        std::string r = ParseJsonStr(resp, "response");
+        if (r.empty()) {
+            // fallback: look for content anywhere
+            auto p2 = resp.find("response");
+            if (p2 != std::string::npos)r = resp.substr(p2 + 10, 20);
+        }
+        return r;
+    }
+    else if (g_extProvider == EXT_OPENAI || g_extProvider == EXT_CLAUDE || g_extProvider == EXT_OTHER) {
+        // OpenAI-compatible chat/completions endpoint
+        std::string host = "api.openai.com";
+        std::string path = "/v1/chat/completions";
+        std::string model = "gpt-4o-mini";
+        if (g_extProvider == EXT_CLAUDE) { host = "api.anthropic.com"; path = "/v1/messages"; model = "claude-haiku-4-5-20251001"; }
+        if (!g_extEndpoint.empty()) {
+            // parse host and path from endpoint like "http://host:port/path"
+            auto ep = g_extEndpoint;
+            if (ep.substr(0, 7) == "http://")ep = ep.substr(7);
+            auto slash = ep.find('/');
+            if (slash != std::string::npos) { host = ep.substr(0, slash); path = ep.substr(slash); }
+            else host = ep;
+            model = g_ollamaModel;
+        }
+
+        // Build OpenAI-format body (works for Claude too with minor header diff)
+        std::string body;
+        if (g_extProvider == EXT_CLAUDE) {
+            body = "{\"model\":\"" + model + "\",\"max_tokens\":16,"
+                "\"messages\":[{\"role\":\"user\",\"content\":\"" + prompt + "\"}]}";
+        }
+        else {
+            body = "{\"model\":\"" + model + "\",\"max_tokens\":16,"
+                "\"messages\":[{\"role\":\"system\",\"content\":\"You are a tank game AI. Reply with one action word only.\"},"
+                "{\"role\":\"user\",\"content\":\"" + prompt + "\"}]}";
+        }
+        std::string hdrs = "Authorization: Bearer " + g_extApiKey + "\r\n";
+        if (g_extProvider == EXT_CLAUDE)
+            hdrs = "x-api-key: " + g_extApiKey + "\r\nanthopic-version: 2023-06-01\r\n";
+        resp = HttpPost(host, 443, path, body, hdrs);
+        // Try to parse content from response
+        std::string r = ParseJsonStr(resp, "content");
+        if (r.empty())r = ParseJsonStr(resp, "text");
+        if (r.empty()) {
+            // crude scan for known actions
+            std::vector<std::string> acts = { "SHOOT_UP","SHOOT_DOWN","SHOOT_LEFT","SHOOT_RIGHT","UP","DOWN","LEFT","RIGHT" };
+            for (auto& a : acts)if (resp.find(a) != std::string::npos)return a;
+        }
+        return r;
+    }
+    return "";
+}
+
+// -- Auto-detect what local AI is available --
+struct DetectedAI { std::string name; ExtAIProvider provider; int port; std::string model; };
+std::vector<DetectedAI> DetectLocalAIs() {
+    std::vector<DetectedAI> found;
+    // Try Ollama on default port
+    WSADATA wsd; WSAStartup(MAKEWORD(2, 2), &wsd);
+    auto tryPort = [&](int port, const std::string& name, ExtAIProvider prov, const std::string& model) {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s == INVALID_SOCKET)return;
+        sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons((u_short)port);
+        a.sin_addr.s_addr = inet_addr("127.0.0.1");
+        DWORD tv = 800; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
+        if (connect(s, (sockaddr*)&a, sizeof(a)) == 0) { found.push_back({ name,prov,port,model }); }
+        closesocket(s);
+        };
+    tryPort(11434, "Ollama (llama3)", EXT_OLLAMA, "llama3");
+    tryPort(11434, "Ollama (mistral)", EXT_OLLAMA, "mistral");
+    tryPort(8080, "LM Studio / llama.cpp", EXT_OTHER, "local-model");
+    tryPort(5000, "LocalAI", EXT_OTHER, "gpt4all-j");
+    tryPort(1234, "GPT4All", EXT_OTHER, "mistral-7b-openhermes");
+    WSACleanup();
+    return found;
 }
 
 // ============================================================
@@ -304,9 +432,11 @@ void SetupPlayers() {
     int kShoot[] = { 'e','o','y',',' };
 
     // Spawn positions
-    float spawnX[] = { 2.5f, (float)(MAP_W - 3.5f), 2.5f,               (float)(MAP_W - 3.5f) };
-    float spawnY[] = { 2.5f, 2.5f,                  (float)(MAP_H - 3.5f),(float)(MAP_H - 3.5f) };
-    int teams[] = { 0, 1, 0, 1 };
+    float spawnX[] = { 2.5f, (float)(MAP_W - 3.5f), 2.5f, (float)(MAP_W - 3.5f) };
+    float spawnY[] = { 2.5f, 2.5f, (float)(MAP_H - 3.5f), (float)(MAP_H - 3.5f) };
+    // Teams: 2p = 1v1 (0,1), 4p = 2v2 (0,1,0,1), otherwise all different
+    int teams[] = { 0,1,0,1 };
+    if (g_numPlayers == 3) { teams[0] = 0; teams[1] = 1; teams[2] = 2; } // FFA
 
     // Spawn facing directions: P1 right, P2 left, P3 right, P4 left
     int spawnDX[] = { 1, -1,  1, -1 };
@@ -507,6 +637,8 @@ void DrawMessage() {}
 //  COLLISION / PHYSICS
 // ============================================================
 
+void CTFInteract(int idx); // forward decl
+
 bool IsWalkable(float nx, float ny) {
     int ix = (int)nx, iy = (int)ny;
     if (ix < 0 || ix >= MAP_W || iy < 0 || iy >= MAP_H) return false;
@@ -647,46 +779,60 @@ void MovePlayer(int idx, int ddx, int ddy) {
     // (old position erased by RenderFrame back-buffer)
     if (IsWalkable(nx, ny)) { p.x = nx; p.y = ny; }
 
-    // CTF: pick up flag
+    // CTF: move carried flag with player
     if (g_mode == CAPTURE_THE_FLAG) {
-        for (int f = 0; f < 2; f++) {
-            if (g_flags[f].carrier == -1 && !g_flags[f].atBase) {
-                if ((int)p.x == (int)g_flags[f].x && (int)p.y == (int)g_flags[f].y) {
-                    if (p.team != f) {
-                        g_flags[f].carrier = idx;
-                        p.hasFlag = true;
-                        ShowMessage(p.name + " picked up the " + (f == 0 ? "RED" : "BLUE") + " flag!", 1.5);
-                    }
-                }
-            }
-        }
-        // Move flag with carrier
         for (int f = 0; f < 2; f++) {
             if (g_flags[f].carrier == idx) {
                 g_flags[f].x = p.x;
                 g_flags[f].y = p.y;
             }
         }
-        // Capture flag at own base
-        int ownBase = p.team;
-        if (p.hasFlag && (int)p.x == (int)g_baseX[ownBase] && (int)p.y == (int)g_baseY[ownBase]) {
+    }
+}
+
+// Called when player presses E (interact) - handles CTF pickup and capture
+void CTFInteract(int idx) {
+    if (g_mode != CAPTURE_THE_FLAG) return;
+    Player& p = g_players[idx];
+    if (!p.alive) return;
+
+    // If carrying enemy flag and standing on OWN base flag -> SCORE
+    if (p.hasFlag) {
+        int ownFlag = p.team; // own flag index matches team
+        if ((int)p.x == (int)g_baseX[p.team] && (int)p.y == (int)g_baseY[p.team]) {
+            // Find which flag we're carrying
             for (int f = 0; f < 2; f++) {
                 if (g_flags[f].carrier == idx) {
-                    // Reset enemy flag
                     g_flags[f].atBase = true;
                     g_flags[f].x = g_baseX[f];
                     g_flags[f].y = g_baseY[f];
                     g_flags[f].carrier = -1;
                     p.hasFlag = false;
-                    p.score++;
-                    // Award team
+                    // Award whole team
                     for (int pi = 0; pi < g_numPlayers; pi++)
                         if (g_players[pi].team == p.team)
                             g_players[pi].score++;
-                    ShowMessage((p.team == 0 ? "RED" : "BLUE") + std::string(" team captured the flag! +1"), 2.0);
-                    if (p.score >= g_scoreLimit) { g_roundOver = true; ShowMessage(p.name + " team WINS!", 4.0); }
+                    ShowMessage((p.team == 0 ? "RED" : "BLUE") + std::string(" team SCORES! +1"), 2.0);
+                    if (g_players[idx].score >= g_scoreLimit) {
+                        g_roundOver = true;
+                        ShowMessage((p.team == 0 ? "RED" : "BLUE") + std::string(" team WINS!"), 4.0);
+                    }
                 }
             }
+        }
+        return;
+    }
+
+    // Not carrying - try to pick up enemy flag
+    for (int f = 0; f < 2; f++) {
+        if (p.team == f) continue; // can't grab own flag
+        float fx = g_flags[f].atBase ? g_baseX[f] : g_flags[f].x;
+        float fy = g_flags[f].atBase ? g_baseY[f] : g_flags[f].y;
+        if (g_flags[f].carrier == -1 && abs((int)p.x - (int)fx) <= 1 && abs((int)p.y - (int)fy) <= 1) {
+            g_flags[f].carrier = idx;
+            g_flags[f].atBase = false;
+            p.hasFlag = true;
+            ShowMessage(p.name + " grabbed the " + (f == 0 ? "RED" : "BLUE") + " flag!", 1.5);
         }
     }
 }
@@ -808,6 +954,8 @@ int Menu(const std::string& title, const std::vector<std::string>& options, int 
         if (c == 80 || c == 's' || c == 'S') sel = (sel + 1) % (int)options.size();
         if (c == 13 || c == ' ') return sel;
         if (c == 27) return -1;
+        if (c == 'q' || c == 'Q') return -2; // secret arcade
+        if (c == 'h' || c == 'H') return -3; // publisher help
     }
 }
 
@@ -1043,23 +1191,13 @@ void UpdateAI(int idx, double dt) {
         // Randomise think rate slightly (120-180ms) so bots feel natural
         ai.thinkTimer = 0.12 + (rand() % 7) * 0.01;
 
-        // Ollama mode: ask LLM for decision asynchronously
-        if (ai.isOllama && g_ollamaEnabled) {
-            // Build compact state string
-            char prompt[512];
-            int tx2 = (bestTarget >= 0) ? (int)g_players[bestTarget].x : -1;
-            int ty2 = (bestTarget >= 0) ? (int)g_players[bestTarget].y : -1;
-            sprintf(prompt,
-                "You control a tank at (%d,%d) facing (%d,%d). "
-                "Enemy at (%d,%d). Health:%d/3. Ammo:%d. Map is %dx%d. "
-                "Reply with ONLY one word: UP DOWN LEFT RIGHT SHOOT_UP SHOOT_DOWN SHOOT_LEFT SHOOT_RIGHT",
-                (int)p.x, (int)p.y, p.dx, p.dy, tx2, ty2,
-                p.health, p.ammo, MAP_W, MAP_H);
-            // Non-blocking: just apply last decision, fire off new request
+        // External AI mode
+        if (g_botAIMode == AI_EXTERNAL) {
+            // Apply previous decision first (non-blocking feel)
             if (!ai.ollamaDecision.empty())
                 ApplyOllamaDecision(idx, ai.ollamaDecision);
-            // Fire request (blocking but short timeout = 2s, won't freeze noticeably)
-            ai.ollamaDecision = OllamaAsk(g_ollamaModel, prompt);
+            // Fire new request (3s timeout won't block noticeably at 120ms think rate)
+            ai.ollamaDecision = ExternalAIAsk(idx);
             return;
         }
 
@@ -1087,17 +1225,18 @@ void UpdateAI(int idx, double dt) {
         // Follow BFS path
         if (!ai.path.empty() && ai.pathStep < (int)ai.path.size()) {
             auto [mdx, mdy] = ai.path[ai.pathStep];
-            // Verify step is still walkable (map may have changed)
             if (IsWalkable(p.x + mdx, p.y + mdy)) {
                 MovePlayer(idx, mdx, mdy);
                 ai.pathStep++;
             }
             else {
-                // Obstacle appeared - replan next tick
                 ai.path.clear();
                 ai.pathStep = 0;
             }
         }
+
+        // CTF: try to interact (grab/score) at each step
+        if (g_mode == CAPTURE_THE_FLAG) CTFInteract(idx);
     }
 }
 
@@ -1126,6 +1265,7 @@ void GameLoop() {
 
     // Reset static timers
     g_firstFrame = true;
+    // (ePrev resets via static init)
 
     DrawMap();
 
@@ -1143,7 +1283,7 @@ void GameLoop() {
         // ---- INPUT ----
         PollInput();
 
-        // ESC = quit
+        // ESC = quit,  T = forfeit this game
         if (g_keys[VK_ESCAPE]) { g_running = false; break; }
 
         // Player movement (once per ~0.12s to avoid too fast)
@@ -1152,6 +1292,7 @@ void GameLoop() {
         bool doMove = moveTimer >= 0.12;
         if (doMove) moveTimer = 0;
 
+        static bool ePrev[4] = {};  // E-key edge detection for CTF interact
         for (int i = 0; i < g_numPlayers; i++) {
             Player& p = g_players[i];
             if (p.shootCooldown > 0) p.shootCooldown -= dt;
@@ -1175,6 +1316,22 @@ void GameLoop() {
             if (g_keys[vkLeft])  MovePlayer(i, -1, 0);
             if (g_keys[vkRight]) MovePlayer(i, 1, 0);
             if (g_keys[vkShoot]) Shoot(i);
+            // E = CTF interact (grab/score flag)
+            if (g_mode == CAPTURE_THE_FLAG) {
+                int vkE = CharToVK(p.keyShoot); // same slot, we'll use a dedicated key
+                // Actually use dedicated E per player: P1=E, P2=O, P3=Y, P4=,
+                // keyShoot already mapped there - so interact = hold E without moving
+                // We detect: if player is not moving but presses shoot key and not in line of sight -> interact
+                bool eDown = g_keys[vkShoot];
+                if (eDown && !ePrev[i]) CTFInteract(i);
+                ePrev[i] = eDown;
+            }
+        }
+
+        // T = forfeit / end game early
+        if (g_keys[0x54]) { // T key = end game early
+            ShowMessage("Game ended by player!", 2.0);
+            g_roundOver = true;
         }
 
         // ---- AI BOTS ----
@@ -1184,7 +1341,7 @@ void GameLoop() {
         UpdateBullets(dt);
 
         // Ammo regen
-        static double ammoTimer = 0;
+        static double ammoTimer = 0.0;
         ammoTimer += dt;
         if (ammoTimer > 5.0) {
             ammoTimer = 0;
@@ -1228,6 +1385,139 @@ void GameLoop() {
 //  MAIN
 // ============================================================
 
+
+// ============================================================
+//  PUBLISHER / TRUST HELPER
+//  Writes HOW_TO_RUN.txt to the desktop and shows instructions
+//  if the user is having trouble running the game.
+// ============================================================
+
+void WriteHelpFile() {
+    char desktopPath[MAX_PATH] = {};
+    if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_DESKTOP, NULL, 0, desktopPath)))
+        GetEnvironmentVariableA("USERPROFILE", desktopPath, MAX_PATH);
+
+    char filePath[MAX_PATH];
+    sprintf(filePath, "%s\\HOW_TO_RUN.txt", desktopPath);
+
+    FILE* f = fopen(filePath, "w");
+    if (!f) return;
+
+    fputs("====================================================\n", f);
+    fputs("  TANK BATTLE - How to Run (Publisher/Trust Fix)\n", f);
+    fputs("====================================================\n\n", f);
+    fputs("Windows blocked this game because it has no publisher\n", f);
+    fputs("certificate. Here are 4 ways to fix it:\n\n", f);
+
+    fputs("----------------------------------------------------\n", f);
+    fputs("OPTION 1 - Easiest: Unblock the file (30 seconds)\n", f);
+    fputs("----------------------------------------------------\n", f);
+    fputs("1. Open File Explorer\n", f);
+    fputs("2. Navigate to the folder where Tank Battle Game.exe is\n", f);
+    fputs("3. Right-click Tank Battle Game.exe\n", f);
+    fputs("4. Click Properties\n", f);
+    fputs("5. At the bottom of the General tab, check Unblock\n", f);
+    fputs("6. Click OK, then double-click the exe to run\n\n", f);
+
+    fputs("----------------------------------------------------\n", f);
+    fputs("OPTION 2 - Run as Administrator\n", f);
+    fputs("----------------------------------------------------\n", f);
+    fputs("1. Right-click Tank Battle Game.exe\n", f);
+    fputs("2. Click Run as administrator\n", f);
+    fputs("3. Click Yes on the UAC prompt\n\n", f);
+
+    fputs("----------------------------------------------------\n", f);
+    fputs("OPTION 3 - Add Windows Defender Exclusion (permanent)\n", f);
+    fputs("----------------------------------------------------\n", f);
+    fputs("1. Open PowerShell as Administrator\n", f);
+    fputs("2. Paste this and press Enter:\n\n", f);
+    fputs("   Add-MpPreference -ExclusionPath \"$env:USERPROFILE\\source\\repos\\Tank Battle Game\"\n\n", f);
+    fputs("3. Run the game normally\n\n", f);
+
+    fputs("----------------------------------------------------\n", f);
+    fputs("OPTION 4 - Self-sign the exe (permanent fix)\n", f);
+    fputs("----------------------------------------------------\n", f);
+    fputs("1. Open PowerShell as Administrator\n", f);
+    fputs("2. Run these commands:\n\n", f);
+    fputs("   $c = New-SelfSignedCertificate -Type CodeSigningCert -Subject CN=TankBattle -CertStoreLocation Cert:\\CurrentUser\\My\n\n", f);
+    fputs("   $s = New-Object System.Security.Cryptography.X509Certificates.X509Store(TrustedPublisher,LocalMachine)\n", f);
+    fputs("   $s.Open(ReadWrite); $s.Add($c); $s.Close()\n\n", f);
+    fputs("   Set-AuthenticodeSignature -FilePath \"FULL PATH TO Tank Battle Game.exe\" -Certificate $c\n\n", f);
+    fputs("3. Windows will now show Tank Battle Game as publisher\n\n", f);
+
+    fputs("====================================================\n", f);
+    fputs("  This file was saved to your Desktop automatically.\n", f);
+    fputs("====================================================\n", f);
+
+    fclose(f);
+}
+
+void ShowPublisherHelp() {
+    // Try to open help file on desktop first
+    WriteHelpFile();
+
+    ClearScreen();
+    SetColor(COL_RED);
+    GotoXY(2, 1);  std::cout << "  !! WINDOWS BLOCKED THIS GAME !!";
+    SetColor(COL_YELLOW);
+    GotoXY(2, 3);  std::cout << "  Windows says: 'No publisher / Application Control policy'";
+    GotoXY(2, 4);  std::cout << "  This is normal for games built in Visual Studio without a";
+    GotoXY(2, 5);  std::cout << "  paid code-signing certificate. The game is safe to run.";
+
+    SetColor(COL_WHITE);
+    GotoXY(2, 7);  std::cout << "  HOW TO FIX IT (pick one):";
+    GotoXY(2, 9);  std::cout << "  [1] Unblock the file:";
+    SetColor(COL_CYAN);
+    GotoXY(2, 10); std::cout << "      Right-click Tank Battle Game.exe";
+    GotoXY(2, 11); std::cout << "      Properties -> check 'Unblock' -> OK";
+
+    SetColor(COL_WHITE);
+    GotoXY(2, 13); std::cout << "  [2] Run as Administrator:";
+    SetColor(COL_CYAN);
+    GotoXY(2, 14); std::cout << "      Right-click exe -> 'Run as administrator'";
+
+    SetColor(COL_WHITE);
+    GotoXY(2, 16); std::cout << "  [3] Add Defender exclusion (PowerShell as Admin):";
+    SetColor(COL_CYAN);
+    GotoXY(2, 17); std::cout << "      Add-MpPreference -ExclusionPath [path to folder]";
+
+    SetColor(COL_WHITE);
+    GotoXY(2, 19); std::cout << "  [4] Self-sign (permanent fix, PowerShell as Admin):";
+    SetColor(COL_CYAN);
+    GotoXY(2, 20); std::cout << "      $c = New-SelfSignedCertificate -Type CodeSigningCert";
+    GotoXY(2, 21); std::cout << "           -Subject 'CN=Tank Battle' -CertStoreLocation";
+    GotoXY(2, 22); std::cout << "           Cert:\\CurrentUser\\My (run in PowerShell)";
+    GotoXY(2, 23); std::cout << "      Set-AuthenticodeSignature -FilePath [exe path] -Certificate $c";
+
+    SetColor(COL_GREEN);
+    GotoXY(2, 25); std::cout << "  A full guide was saved to your Desktop: HOW_TO_RUN.txt";
+
+    SetColor(COL_DARK_GRAY);
+    GotoXY(2, 27); std::cout << "  Press H during the game at any time to see this again.";
+    GotoXY(2, 28); std::cout << "  Press any key to continue to the game...";
+    ResetColor();
+    (void)_getch();
+}
+
+bool WasBlockedByPolicy() {
+    // Check if we're running from a location that commonly triggers AppLocker
+    // (temp folders, downloads, etc.)
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    std::string path(exePath);
+    // Convert to lowercase for comparison
+    for (auto& c : path) c = (char)tolower((unsigned char)c);
+
+    // Suspicious paths that trigger AppLocker
+    bool suspicious =
+        path.find("\\temp\\") != std::string::npos ||
+        path.find("\\tmp\\") != std::string::npos ||
+        path.find("\\downloads\\") != std::string::npos ||
+        path.find("\\appdata\\") != std::string::npos;
+
+    return suspicious;
+}
+
 int main() {
     srand((unsigned)time(0));
 
@@ -1243,6 +1533,20 @@ int main() {
     SetConsoleTitleA("Tank Battle - Local Multiplayer");
 
     HideCursor();
+
+    // Show publisher help if running from a path that commonly gets blocked
+    // or if user runs the game for the first time
+    {
+        char exePath[MAX_PATH] = {};
+        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+        std::string ep(exePath);
+        for (auto& ch : ep) ch = (char)tolower((unsigned char)ch);
+        bool suspicious =
+            ep.find("\\temp\\") != std::string::npos ||
+            ep.find("\\downloads\\") != std::string::npos ||
+            ep.find("\\appdata\\") != std::string::npos;
+        if (suspicious) ShowPublisherHelp();
+    }
 
     // ============================================================
     //  SECRET ARCADE  (Q in main menu)
@@ -1480,31 +1784,24 @@ int main() {
     while (true) {
         // ---- Step 1: Player count ----
         DrawTitle();
+        // H = show publisher/trust help at any time from lobby
+        GotoXY(2, 28); SetColor(COL_DARK_GRAY);
+        std::cout << "  [H] How to run if Windows blocks this game";
+        ResetColor();
         std::vector<std::string> playerOpts = {
             "1 Player (vs 3 AI bots)",
             "2 Players",
             "3 Players",
             "4 Players"
         };
-        // Q = Secret Arcade
-        GotoXY(2, 26); SetColor(COL_DARK_GRAY);
-        std::cout << "  [Q] Secret Arcade";
-        ResetColor();
-
-        // Poll for Q before showing menu
-        bool goArcade = false;
-        {
-            // Short wait to let key settle
-            for (int qi = 0; qi < 5; qi++) { Sleep(30); if (GetAsyncKeyState('Q') & 0x8000) { goArcade = true; break; } }
-        }
-        if (goArcade) {
+        int pc = Menu("Select Number of Players  [UP/DOWN + ENTER]  Q=more:", playerOpts, 2, 13);
+        if (pc == -3) { ShowPublisherHelp(); continue; }
+        if (pc == -2) {
+            // Q was pressed - show bonus games selector
             ClearScreen();
-            GotoXY(2, 2);  SetColor(COL_YELLOW); std::cout << "  *** SECRET ARCADE ***";
-            GotoXY(2, 4);  SetColor(COL_WHITE);  std::cout << "  1. Snake";
-            GotoXY(2, 5);                         std::cout << "  2. Pong";
-            GotoXY(2, 6);                         std::cout << "  3. Breakout";
-            GotoXY(2, 7);                         std::cout << "  4. Tetris";
-            GotoXY(2, 8);                         std::cout << "  5. Space Invaders";
+            const char* _mn[] = { "Snake","Pong","Breakout","Tetris","Space Invaders" };
+            GotoXY(2, 2); SetColor(COL_YELLOW); std::cout << "  --- Bonus Games ---";
+            for (int _mi = 0; _mi < 5; _mi++) { GotoXY(2, 4 + _mi); SetColor(COL_WHITE); std::cout << "  " << (_mi + 1) << ". " << _mn[_mi]; }
             GotoXY(2, 10); SetColor(COL_DARK_GRAY); std::cout << "  ESC = back to menu";
             ResetColor();
             int arcadeChoice = _getch();
@@ -1515,8 +1812,6 @@ int main() {
             else if (arcadeChoice == '5') RunSpaceInvaders();
             continue;
         }
-
-        int pc = Menu("Select Number of Players  [UP/DOWN + ENTER]:", playerOpts, 2, 13);
         if (pc < 0) break;
         for (int i = 0; i < 4; i++) g_isBot[i] = false;
         if (pc == 0) {
@@ -1527,39 +1822,105 @@ int main() {
             g_numPlayers = pc + 1;
         }
 
-        // ---- Step 1b: Ollama setup (only if bots present) ----
+        // ---- Step 1b: AI mode selection (only if bots present) ----
         bool anyBot = false;
         for (int i = 0; i < 4; i++) if (g_isBot[i]) anyBot = true;
-        if (anyBot && g_numPlayers > 0) {
+        if (anyBot) {
             DrawTitle();
-            GotoXY(2, 13); SetColor(COL_YELLOW); std::cout << "  OLLAMA AI SUPPORT";
-            GotoXY(2, 15); SetColor(COL_WHITE);  std::cout << "  Do bots use your local Ollama AI?";
-            GotoXY(2, 17); SetColor(COL_CYAN);   std::cout << "  Y = Yes (needs Ollama running on port 11434)";
-            GotoXY(2, 18); SetColor(COL_WHITE);  std::cout << "  N = No  (built-in smart AI)";
-            GotoXY(2, 20); SetColor(COL_DARK_GRAY); std::cout << "  Ollama: https://ollama.com  |  run: ollama run llama3";
+            GotoXY(2, 13); SetColor(COL_YELLOW); std::cout << "  BOT AI TYPE";
+            GotoXY(2, 15); SetColor(COL_WHITE);  std::cout << "  1 = Built-in AI  (smart BFS pathfinding, always works)";
+            GotoXY(2, 16); SetColor(COL_CYAN);   std::cout << "  2 = Real AI      (uses your local AI or API key)";
+            GotoXY(2, 18); SetColor(COL_DARK_GRAY); std::cout << "  Real AI supports: Ollama, LM Studio, OpenAI, Claude, etc.";
             ResetColor();
-            int oc = _getch();
-            if (oc == 'y' || oc == 'Y') {
-                g_ollamaEnabled = true;
-                // Ask model name
+            int aiChoice = _getch();
+            g_botAIMode = (aiChoice == '2') ? AI_EXTERNAL : AI_BUILTIN;
+
+            if (g_botAIMode == AI_EXTERNAL) {
                 ClearScreen();
-                GotoXY(2, 4); SetColor(COL_YELLOW); std::cout << "Enter Ollama model name (default: llama3):";
-                GotoXY(2, 6); SetColor(COL_WHITE);
-                // Restore echo for input
-                HANDLE hIn2 = GetStdHandle(STD_INPUT_HANDLE);
-                SetConsoleMode(hIn2, ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
-                std::string modelIn; std::getline(std::cin, modelIn);
-                if (!modelIn.empty()) g_ollamaModel = modelIn;
-                SetConsoleMode(hIn2, ENABLE_PROCESSED_INPUT);
-                for (int i = 0; i < 4; i++) if (g_isBot[i]) g_aiState[i].isOllama = true;
-                GotoXY(2, 8); SetColor(COL_GREEN);
-                std::cout << "Ollama enabled! Model: " << g_ollamaModel;
-                GotoXY(2, 10); SetColor(COL_WHITE); std::cout << "Press any key...";
+                GotoXY(2, 2); SetColor(COL_YELLOW); std::cout << "  REAL AI SETUP - Searching for local AI...";
+                GotoXY(2, 4); SetColor(COL_WHITE);
+
+                // Auto-detect
+                auto found = DetectLocalAIs();
+                int row = 5;
+                if (!found.empty()) {
+                    GotoXY(2, row++); SetColor(COL_GREEN); std::cout << "  Found local AI:";
+                    for (int fi = 0; fi < (int)found.size(); fi++) {
+                        GotoXY(4, row++); SetColor(COL_WHITE);
+                        char ln[80]; sprintf(ln, "%d. %s", fi + 1, found[fi].name.c_str()); std::cout << ln;
+                    }
+                    GotoXY(2, row++); SetColor(COL_CYAN);  std::cout << "  " << (found.size() + 1) << ". Enter API key (OpenAI/Claude/other)";
+                    GotoXY(2, row++); SetColor(COL_WHITE); std::cout << "  Select (or press ENTER for first):";
+                    ResetColor();
+                    int sel = _getch() - '0' - 1;
+                    if (sel < 0 || sel >= (int)found.size()) {
+                        // API key entry
+                        ClearScreen();
+                        GotoXY(2, 2); SetColor(COL_YELLOW); std::cout << "  Choose provider:";
+                        GotoXY(2, 4); SetColor(COL_WHITE); std::cout << "  1. OpenAI (gpt-4o-mini)";
+                        GotoXY(2, 5);                     std::cout << "  2. Claude  (claude-haiku)";
+                        GotoXY(2, 6);                     std::cout << "  3. Other   (OpenAI-compatible endpoint)";
+                        ResetColor();
+                        int psel = _getch() - '0';
+                        HANDLE hIn2 = GetStdHandle(STD_INPUT_HANDLE);
+                        SetConsoleMode(hIn2, ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+                        GotoXY(2, 8); SetColor(COL_YELLOW); std::cout << "  Enter API key: ";
+                        std::getline(std::cin, g_extApiKey);
+                        if (psel == 1) { g_extProvider = EXT_OPENAI; g_ollamaModel = "gpt-4o-mini"; }
+                        else if (psel == 2) { g_extProvider = EXT_CLAUDE; g_ollamaModel = "claude-haiku-4-5-20251001"; }
+                        else {
+                            g_extProvider = EXT_OTHER;
+                            GotoXY(2, 10); std::cout << "  Endpoint (e.g. http://127.0.0.1:8080): ";
+                            std::getline(std::cin, g_extEndpoint);
+                            GotoXY(2, 12); std::cout << "  Model name: ";
+                            std::getline(std::cin, g_ollamaModel);
+                        }
+                        SetConsoleMode(hIn2, ENABLE_PROCESSED_INPUT);
+                    }
+                    else {
+                        g_extProvider = found[sel].provider;
+                        g_ollamaPort = found[sel].port;
+                        g_ollamaModel = found[sel].model;
+                    }
+                }
+                else {
+                    // No local AI found - offer API key
+                    GotoXY(2, row++); SetColor(COL_RED);   std::cout << "  No local AI found on common ports.";
+                    GotoXY(2, row++); SetColor(COL_WHITE);
+                    GotoXY(2, row++);                       std::cout << "  1. OpenAI API key";
+                    GotoXY(2, row++);                       std::cout << "  2. Claude API key";
+                    GotoXY(2, row++);                       std::cout << "  3. Custom endpoint";
+                    GotoXY(2, row++);                       std::cout << "  4. Use built-in AI instead";
+                    ResetColor();
+                    int psel = _getch() - '0';
+                    if (psel == 4) { g_botAIMode = AI_BUILTIN; }
+                    else {
+                        HANDLE hIn2 = GetStdHandle(STD_INPUT_HANDLE);
+                        SetConsoleMode(hIn2, ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+                        GotoXY(2, row); SetColor(COL_YELLOW); std::cout << "  API key: ";
+                        std::getline(std::cin, g_extApiKey);
+                        if (psel == 1) { g_extProvider = EXT_OPENAI; g_ollamaModel = "gpt-4o-mini"; }
+                        else if (psel == 2) { g_extProvider = EXT_CLAUDE; g_ollamaModel = "claude-haiku-4-5-20251001"; }
+                        else {
+                            g_extProvider = EXT_OTHER;
+                            GotoXY(2, row + 2); std::cout << "  Endpoint: ";
+                            std::getline(std::cin, g_extEndpoint);
+                        }
+                        SetConsoleMode(hIn2, ENABLE_PROCESSED_INPUT);
+                    }
+                }
+                ClearScreen();
+                GotoXY(2, 4); SetColor(COL_GREEN);
+                std::cout << "  AI Mode: " << (g_botAIMode == AI_EXTERNAL ? "Real AI" : "Built-in AI");
+                if (g_botAIMode == AI_EXTERNAL) {
+                    GotoXY(2, 5); std::cout << "  Provider: ";
+                    if (g_extProvider == EXT_OLLAMA)std::cout << "Ollama  Model:" << g_ollamaModel;
+                    else if (g_extProvider == EXT_OPENAI)std::cout << "OpenAI  Model:" << g_ollamaModel;
+                    else if (g_extProvider == EXT_CLAUDE)std::cout << "Claude  Model:" << g_ollamaModel;
+                    else std::cout << "Custom  Endpoint:" << g_extEndpoint;
+                }
+                GotoXY(2, 7); SetColor(COL_WHITE); std::cout << "  Press any key..."; ResetColor();
                 (void)_getch();
-            }
-            else {
-                g_ollamaEnabled = false;
-                for (int i = 0; i < 4; i++) g_aiState[i].isOllama = false;
             }
         }
 
