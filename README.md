@@ -1,1 +1,3 @@
-This Game Should Be Played On Visual Studio Or Complier For C++
+This Game Should Be Played On Visual Studio For C++
+|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+All Bugs I Will Try To Fix 👍
